@@ -31,7 +31,7 @@ const { useState, useCallback, useRef } = React;
 const WHOLE_WORD_QUALIFY    = ["soc","red","purple"];
 const SUBSTRING_QUALIFY     = ["cyber","security","detection","threat","secops","cybersecurity","ciso","information security","infosec","siem","penetration","pentest","vuln","vulnerability","analyst"];
 const WHOLE_WORD_DISQUALIFY = ["app","dev","gov"];
-const SUBSTRING_DISQUALIFY  = ["application","federal","partner","developer","corporate","consultant","government"];
+const SUBSTRING_DISQUALIFY  = ["application","federal","partner","developer","corporate","consultant","government","services", "practice", "training", "enablement", "business", "product", "advisor"];
 
 function hasMatch(title, ww, sub) {
   for (const kw of ww) if (new RegExp("\\b" + kw + "\\b","i").test(title)) return true;
