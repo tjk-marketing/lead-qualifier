@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CardinalOps — Lead Intelligence</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #080b10; }
+    #root { min-height: 100vh; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(16px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #080b10; }
+    ::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 3px; }
+    tr:hover td { background: rgba(0,229,160,0.03) !important; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useCallback, useRef } = React;
+
+// ── Qualification Logic ──────────────────────────────────────────────────────
+const WHOLE_WORD_QUALIFY    = ["soc","red","purple"];
+const SUBSTRING_QUALIFY     = ["cyber","security","detection","threat","secops","cybersecurity","ciso","information security","infosec","siem","penetration","pentest","vuln","vulnerability","analyst"];
+const WHOLE_WORD_DISQUALIFY = ["app","dev","gov"];
+const SUBSTRING_DISQUALIFY  = ["application","federal","partner","developer","corporate","consultant","government"];
+
+function hasMatch(title, ww, sub) {
+  for (const kw of ww) if (new RegExp(`\\b${kw}\\b`,"i").test(title)) return true;
+  for (const kw of sub) if (title.toLowerCase().includes(kw)) return true;
+  return false;
+}
+
+function classifyLead(title, email) {
+  const e = (email||"").toLowerCase();
+  const t = (title||"").toLowerCase().trim();
+  if (/\.(gov|mil)(\.|$|\/)/.test(e)) return "Unqualified";
+  if (!t) return "Unqualified";
+  if (hasMatch(t, WHOLE_WORD_DISQUALIFY, SUBSTRING_DISQUALIFY)) return "Unqualified";
+  if (hasMatch(t, WHOLE_WORD_QUALIFY, SUBSTRING_QUALIFY)) return "Qualified";
+  return "Unqualified";
+}
+
+// ── ICP Scoring ──────────────────────────────────────────────────────────────
+const TIER1 = [/detection.engin/i,/soc.director/i,/soc.manager/i,/head of soc/i,/head of detection/i,/threat.detection/i,/threat.management/i,/cyber.defense/i,/siem/i,/secops/i,/security.operat/i,/director.*security/i,/vp.*security/i,/manager.*security/i,/head.*security/i];
+const TIER2 = [/ciso/i,/chief information security/i,/svp.*security/i];
+const TIER3 = [/soc.analyst/i,/detection.engineer/i,/threat.hunter/i,/security.analyst/i,/analyst/i];
+const TARGET_IND  = ["financial","insurance","energy","manufacturing","infrastructure","legal","information technology","technology","healthcare","retail","telecom"];
+const AVOID_IND   = ["government","public sector","federal","education"];
+const SIEMS       = ["splunk","sentinel","qradar","chronicle","sumo","elastic","crowdstrike","xsiam","coralogix"];
+
+function scoreICP(row, titleCol, emailCol, companyCol, industryCol) {
+  let score = 0, tier = null;
+  const t = (row[titleCol]||"").toLowerCase();
+  const co = (row[companyCol]||"").toLowerCase();
+  const ind = (row[industryCol]||"").toLowerCase();
+  if (TIER1.some(p=>p.test(t)))      { tier=1; score+=40; }
+  else if (TIER2.some(p=>p.test(t))) { tier=2; score+=25; }
+  else if (TIER3.some(p=>p.test(t))) { tier=3; score+=15; }
+  if (AVOID_IND.some(k=>ind.includes(k)||co.includes(k)))   score-=30;
+  else if (TARGET_IND.some(k=>ind.includes(k)||co.includes(k))) score+=20;
+  if (SIEMS.some(s=>t.includes(s)||co.includes(s))) score+=15;
+  if (/enterprise|fortune|global|inc\b|corp\b|ltd\b|llc\b/.test(co)) score+=5;
+  return { score: Math.max(0,Math.min(100,score)), tier };
+}
+
+// ── File Parsing ─────────────────────────────────────────────────────────────
+function parseCSVText(text) {
+  const lines = text.trim().split(/\r?\n/);
+  const headers = lines[0].split(",").map(h=>h.replace(/^"|"$/g,"").trim());
+  const rows = [];
+  for (let i=1;i<lines.length;i++) {
+    const vals = lines[i].split(",").map(v=>v.replace(/^"|"$/g,"").trim());
+    if (vals.length<2) continue;
+    const row={};
+    headers.forEach((h,idx)=>{ row[h]=vals[idx]||""; });
+    rows.push(row);
+  }
+  return {headers,rows};
+}
+
+function parseExcel(buffer) {
+  const wb = XLSX.read(buffer, {type:"array"});
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const data = XLSX.utils.sheet_to_json(ws,{defval:""});
+  const headers = data.length ? Object.keys(data[0]) : [];
+  return {headers, rows:data};
+}
+
+function detectCol(headers, keywords) {
+  return headers.find(h=>keywords.some(k=>h.toLowerCase().includes(k)))||null;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const tierInfo = (tier) => {
+  if (tier===1) return {label:"Tier 1",color:"#00e5a0"};
+  if (tier===2) return {label:"Tier 2",color:"#f5c842"};
+  if (tier===3) return {label:"Tier 3",color:"#7eb6ff"};
+  return {label:"—",color:"#444"};
+};
+
+const s = {
+  th: { padding:"12px 16px", textAlign:"left", color:"#444", fontSize:11, letterSpacing:"1.5px", textTransform:"uppercase", fontWeight:600, whiteSpace:"nowrap" },
+  td: { padding:"11px 16px", verticalAlign:"middle", borderBottom:"1px solid #111620" },
+};
+
+// ── ScoreBar ─────────────────────────────────────────────────────────────────
+function ScoreBar({score}) {
+  const color = score>=60?"#00e5a0":score>=30?"#f5c842":"#ff5e5e";
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:8}}>
+      <div style={{width:56,height:4,background:"#1a1f2c",borderRadius:2}}>
+        <div style={{width:`${score}%`,height:"100%",background:color,borderRadius:2,transition:"width 0.5s ease"}}/>
+      </div>
+      <span style={{color,fontSize:12,fontWeight:600,minWidth:24}}>{score}</span>
+    </div>
+  );
+}
+
+// ── Lead Table ────────────────────────────────────────────────────────────────
+function LeadTable({leads, results, showScore}) {
+  if (!leads.length) return <p style={{color:"#444",textAlign:"center",padding:48}}>No leads to display.</p>;
+  const getName = row => {
+    const n = results.nameCol ? row[results.nameCol] : null;
+    return n || (results.emailCol ? row[results.emailCol] : null) || `Lead #${row._id+1}`;
+  };
+  return (
+    <div style={{overflowX:"auto",borderRadius:12,border:"1px solid #141820"}}>
+      <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+        <thead>
+          <tr style={{background:"rgba(0,0,0,0.5)"}}>
+            {showScore && <th style={s.th}>#</th>}
+            <th style={s.th}>Name / Email</th>
+            <th style={s.th}>Title</th>
+            {results.companyCol && <th style={s.th}>Company</th>}
+            <th style={s.th}>Status</th>
+            {showScore && <th style={s.th}>ICP Score</th>}
+            {showScore && <th style={s.th}>Tier</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {leads.map((row,i)=>{
+            const ti = tierInfo(row._tier);
+            const isQ = row._status==="Qualified";
+            return (
+              <tr key={row._id} style={{background:i%2===0?"rgba(255,255,255,0.01)":"transparent"}}>
+                {showScore && <td style={s.td}><span style={{color:"#444",fontWeight:700}}>{i+1}</span></td>}
+                <td style={s.td}><span style={{color:"#ddd"}}>{getName(row)}</span></td>
+                <td style={s.td}><span style={{color:"#888"}}>{row[results.titleCol]||"—"}</span></td>
+                {results.companyCol && <td style={s.td}><span style={{color:"#666"}}>{row[results.companyCol]||"—"}</span></td>}
+                <td style={s.td}>
+                  <span style={{
+                    display:"inline-block",padding:"2px 10px",borderRadius:20,fontSize:11,fontWeight:600,
+                    background:isQ?"rgba(0,229,160,0.12)":"rgba(255,94,94,0.1)",
+                    color:isQ?"#00e5a0":"#ff5e5e",
+                    border:`1px solid ${isQ?"rgba(0,229,160,0.25)":"rgba(255,94,94,0.2)"}`
+                  }}>{row._status}</span>
+                </td>
+                {showScore && <td style={s.td}><ScoreBar score={row._score}/></td>}
+                {showScore && <td style={s.td}>
+                  <span style={{
+                    display:"inline-block",padding:"2px 10px",borderRadius:20,fontSize:11,fontWeight:600,
+                    background:`${ti.color}18`,color:ti.color,border:`1px solid ${ti.color}44`
+                  }}>{ti.label}</span>
+                </td>}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App() {
+  const [stage, setStage]         = useState("upload");
+  const [dragging, setDragging]   = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [results, setResults]     = useState(null);
+  const [activeTab, setActiveTab] = useState("overview");
+  const [filter, setFilter]       = useState("all");
+  const fileRef = useRef();
+
+  const process = useCallback((file) => {
+    if (!file) return;
+    setProcessing(true);
+    const isExcel = /\.(xlsx|xls)$/i.test(file.name);
+    const reader  = new FileReader();
+    reader.onload = (e) => {
+      try {
+        let headers, rows;
+        if (isExcel) {
+          ({headers,rows} = parseExcel(new Uint8Array(e.target.result)));
+        } else {
+          ({headers,rows} = parseCSVText(e.target.result));
+        }
+
+        const titleCol   = detectCol(headers,["title","job","role","position"]) || headers[0];
+        const emailCol   = detectCol(headers,["email","e-mail"]) || null;
+        const companyCol = detectCol(headers,["company","organization","account","employer"]) || null;
+        const industryCol= detectCol(headers,["industry","sector","vertical"]) || null;
+        const nameCol    = detectCol(headers,["name","first","last","contact"]) || null;
+
+        const processed = rows.map((row,idx)=>{
+          const status = classifyLead(row[titleCol], emailCol?row[emailCol]:"");
+          const icp    = status==="Qualified" ? scoreICP(row,titleCol,emailCol,companyCol,industryCol) : {score:0,tier:null};
+          return {...row, _id:idx, _status:status, _score:icp.score, _tier:icp.tier};
+        });
+
+        const qualified   = processed.filter(r=>r._status==="Qualified");
+        const unqualified = processed.filter(r=>r._status==="Unqualified");
+        const top10       = [...qualified].sort((a,b)=>b._score-a._score).slice(0,10);
+        const emailDQ     = unqualified.filter(r=>emailCol&&/\.(gov|mil)(\.|$|\/)/.test((r[emailCol]||"").toLowerCase())).length;
+
+        setResults({total:processed.length,qualified,unqualified,top10,processed,titleCol,emailCol,nameCol,companyCol,headers,emailDQ,titleDQ:unqualified.length-emailDQ,fileName:file.name});
+        setStage("results");
+        setActiveTab("overview");
+        setFilter("all");
+      } catch(err) {
+        alert("Could not parse file: "+err.message);
+      }
+      setProcessing(false);
+    };
+    if (isExcel) reader.readAsArrayBuffer(file);
+    else reader.readAsText(file);
+  },[]);
+
+  const onDrop = (e) => { e.preventDefault(); setDragging(false); process(e.dataTransfer.files[0]); };
+  const qualPct = results ? Math.round((results.qualified.length/results.total)*100) : 0;
+  const filteredLeads = results
+    ? (filter==="qualified"?results.qualified : filter==="unqualified"?results.unqualified : results.processed)
+    : [];
+
+  return (
+    <div style={{minHeight:"100vh",background:"#080b10",color:"#e0e0e0",fontFamily:"'DM Mono',monospace",position:"relative",overflow:"hidden"}}>
+
+      {/* Grid */}
+      <div style={{position:"fixed",inset:0,zIndex:0,backgroundImage:"linear-gradient(rgba(0,229,160,0.035) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,160,0.035) 1px,transparent 1px)",backgroundSize:"44px 44px",pointerEvents:"none"}}/>
+
+      <div style={{position:"relative",zIndex:1,maxWidth:1120,margin:"0 auto",padding:"44px 24px",animation:"fadeUp 0.5s ease both"}}>
+
+        {/* Header */}
+        <div style={{marginBottom:44}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+            <div style={{width:8,height:8,borderRadius:"50%",background:"#00e5a0",boxShadow:"0 0 14px #00e5a0"}}/>
+            <span style={{color:"#00e5a0",fontSize:10,letterSpacing:"3px",textTransform:"uppercase",fontFamily:"'DM Mono',monospace"}}>CardinalOps</span>
+          </div>
+          <h1 style={{fontFamily:"'Syne',sans-serif",fontSize:34,fontWeight:800,margin:0,letterSpacing:-1,background:"linear-gradient(130deg,#fff 0%,#00e5a0 100%)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>
+            Lead Intelligence
+          </h1>
+          <p style={{color:"#3a4050",fontSize:13,marginTop:7,fontFamily:"'DM Mono',monospace"}}>
+            Upload a lead list → qualify, score, and rank against ICP
+          </p>
+        </div>
+
+        {/* ── UPLOAD STAGE ── */}
+        {stage==="upload" && (
+          <div
+            onClick={()=>fileRef.current.click()}
+            onDragOver={e=>{e.preventDefault();setDragging(true);}}
+            onDragLeave={()=>setDragging(false)}
+            onDrop={onDrop}
+            style={{
+              border:`2px dashed ${dragging?"#00e5a0":"#1e2330"}`,
+              borderRadius:18,padding:"90px 40px",textAlign:"center",cursor:"pointer",
+              transition:"all 0.2s",
+              background:dragging?"rgba(0,229,160,0.04)":"rgba(255,255,255,0.015)",
+            }}
+          >
+            <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" style={{display:"none"}} onChange={e=>process(e.target.files[0])}/>
+            {processing ? (
+              <div>
+                <div style={{width:44,height:44,border:"2px solid #00e5a0",borderTopColor:"transparent",borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto 18px"}}/>
+                <p style={{color:"#00e5a0",fontFamily:"'DM Mono',monospace",fontSize:14}}>Analyzing leads…</p>
+              </div>
+            ) : (
+              <>
+                <div style={{fontSize:52,marginBottom:18,filter:"grayscale(0.3)"}}>⬆</div>
+                <p style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:700,marginBottom:8,color:"#ccc"}}>Drop your lead file here</p>
+                <p style={{color:"#3a4050",fontSize:13}}>Supports CSV, Excel (.xlsx, .xls)</p>
+                <div style={{display:"inline-block",marginTop:26,padding:"10px 28px",border:"1px solid #00e5a0",borderRadius:8,color:"#00e5a0",fontSize:13,letterSpacing:1}}>
+                  Browse Files
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ── RESULTS STAGE ── */}
+        {stage==="results" && results && (
+          <>
+            {/* Top bar */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:30}}>
+              <button onClick={()=>setStage("upload")} style={{background:"none",border:"1px solid #1e2330",color:"#666",padding:"7px 16px",borderRadius:7,cursor:"pointer",fontSize:12,fontFamily:"'DM Mono',monospace"}}>
+                ← New Upload
+              </button>
+              <span style={{color:"#2a3040",fontSize:12,fontFamily:"'DM Mono',monospace"}}>📄 {results.fileName}</span>
+            </div>
+
+            {/* Stat Cards */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:28}}>
+              {[
+                {label:"Total Leads",  value:results.total,            color:"#ccc"},
+                {label:"Qualified",    value:results.qualified.length,  color:"#00e5a0", glow:true},
+                {label:"Unqualified",  value:results.unqualified.length,color:"#ff5e5e"},
+                {label:"Qual Rate",    value:`${qualPct}%`,             color:"#f5c842"},
+              ].map(c=>(
+                <div key={c.label} style={{background:"rgba(255,255,255,0.025)",border:"1px solid #141820",borderRadius:14,padding:"22px 24px"}}>
+                  <div style={{color:"#3a4050",fontSize:10,letterSpacing:"2px",textTransform:"uppercase",marginBottom:10,fontFamily:"'DM Mono',monospace"}}>{c.label}</div>
+                  <div style={{fontFamily:"'Syne',sans-serif",fontSize:38,fontWeight:800,color:c.color,textShadow:c.glow?`0 0 24px ${c.color}55`:"none"}}>{c.value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Qual bar */}
+            <div style={{marginBottom:26}}>
+              <div style={{height:5,borderRadius:3,background:"#141820",overflow:"hidden"}}>
+                <div style={{width:`${qualPct}%`,height:"100%",background:"linear-gradient(90deg,#00e5a0,#00bfff)",borderRadius:3,transition:"width 0.9s ease"}}/>
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between",marginTop:7,fontSize:11,fontFamily:"'DM Mono',monospace"}}>
+                <span style={{color:"#00e5a0"}}>{qualPct}% Qualified</span>
+                <span style={{color:"#ff5e5e"}}>{100-qualPct}% Unqualified</span>
+              </div>
+            </div>
+
+            {/* Tabs */}
+            <div style={{display:"flex",gap:2,marginBottom:20,borderBottom:"1px solid #141820"}}>
+              {[{id:"overview",label:"Top 10 ICP Matches"},{id:"all",label:`All Leads (${results.total})`}].map(t=>(
+                <button key={t.id} onClick={()=>setActiveTab(t.id)} style={{
+                  background:"none",border:"none",cursor:"pointer",padding:"10px 22px",fontSize:13,
+                  fontFamily:"'DM Mono',monospace",
+                  color:activeTab===t.id?"#00e5a0":"#444",
+                  borderBottom:activeTab===t.id?"2px solid #00e5a0":"2px solid transparent",
+                  transition:"all 0.15s"
+                }}>{t.label}</button>
+              ))}
+            </div>
+
+            {/* DQ info */}
+            <div style={{background:"rgba(255,255,255,0.02)",border:"1px solid #141820",borderRadius:10,padding:"12px 18px",marginBottom:22,fontSize:12,color:"#3a4050",display:"flex",gap:28,fontFamily:"'DM Mono',monospace"}}>
+              <span>⚠ <strong style={{color:"#888"}}>{results.titleDQ}</strong> disqualified by job title</span>
+              {results.emailDQ>0 && <span>🚫 <strong style={{color:"#888"}}>{results.emailDQ}</strong> disqualified by email domain (.gov/.mil)</span>}
+            </div>
+
+            {/* Overview: Top 10 */}
+            {activeTab==="overview" && <LeadTable leads={results.top10} results={results} showScore={true}/>}
+
+            {/* All Leads */}
+            {activeTab==="all" && (
+              <>
+                <div style={{display:"flex",gap:8,marginBottom:16}}>
+                  {["all","qualified","unqualified"].map(f=>(
+                    <button key={f} onClick={()=>setFilter(f)} style={{
+                      padding:"6px 16px",borderRadius:6,fontSize:12,cursor:"pointer",fontFamily:"'DM Mono',monospace",
+                      background:filter===f?"#00e5a0":"transparent",
+                      color:filter===f?"#080b10":"#555",
+                      border:`1px solid ${filter===f?"#00e5a0":"#1e2330"}`,
+                      fontWeight:filter===f?700:400
+                    }}>
+                      {f.charAt(0).toUpperCase()+f.slice(1)} ({f==="all"?results.total:f==="qualified"?results.qualified.length:results.unqualified.length})
+                    </button>
+                  ))}
+                </div>
+                <LeadTable leads={filteredLeads.slice(0,500)} results={results} showScore={false}/>
+                {filteredLeads.length>500 && <p style={{color:"#3a4050",fontSize:12,textAlign:"center",marginTop:14,fontFamily:"'DM Mono',monospace"}}>Showing first 500 of {filteredLeads.length} leads</p>}
+              </>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
