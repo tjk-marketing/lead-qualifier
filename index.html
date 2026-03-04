@@ -28,10 +28,11 @@
 <script type="text/babel">
 const { useState, useCallback, useRef } = React;
 
+// ── Qualification (disqualify/qualify by title + email) ───────────────────────
 const WHOLE_WORD_QUALIFY    = ["soc","red","purple"];
 const SUBSTRING_QUALIFY     = ["cyber","security","detection","threat","secops","cybersecurity","ciso","information security","infosec","siem","penetration","pentest","vuln","vulnerability","analyst"];
 const WHOLE_WORD_DISQUALIFY = ["app","dev","gov"];
-const SUBSTRING_DISQUALIFY  = ["application","federal","partner","developer","corporate","consultant","government","services", "practice", "training", "enablement", "business", "product", "advisor"];
+const SUBSTRING_DISQUALIFY  = ["application","federal","partner","developer","corporate","consultant","government","services","practice","training","enablement","business","product","advisor"];
 
 function hasMatch(title, ww, sub) {
   for (const kw of ww) if (new RegExp("\\b" + kw + "\\b","i").test(title)) return true;
@@ -48,28 +49,201 @@ function classifyLead(title, email) {
   return "Unqualified";
 }
 
-const TIER1 = [/detection.engin/i,/soc.director/i,/soc.manager/i,/head of soc/i,/head of detection/i,/threat.detection/i,/threat.management/i,/cyber.defense/i,/siem/i,/secops/i,/security.operat/i,/director.*security/i,/vp.*security/i,/manager.*security/i,/head.*security/i];
-const TIER2 = [/ciso/i,/chief information security/i,/svp.*security/i];
-const TIER3 = [/soc.analyst/i,/detection.engineer/i,/threat.hunter/i,/security.analyst/i,/analyst/i];
-const TARGET_IND = ["financial","insurance","energy","manufacturing","infrastructure","legal","information technology","technology","healthcare","retail","telecom"];
-const AVOID_IND  = ["government","public sector","federal","education"];
-const SIEMS      = ["splunk","sentinel","qradar","chronicle","sumo","elastic","crowdstrike","xsiam","coralogix"];
+// ── ICP Scoring v3 ────────────────────────────────────────────────────────────
 
-function scoreICP(row, titleCol, emailCol, companyCol, industryCol) {
-  let score = 0, tier = null;
-  const t   = (row[titleCol]||"").toLowerCase();
-  const co  = (row[companyCol]||"").toLowerCase();
-  const ind = (row[industryCol]||"").toLowerCase();
-  if (TIER1.some(p=>p.test(t)))      { tier=1; score+=40; }
-  else if (TIER2.some(p=>p.test(t))) { tier=2; score+=25; }
-  else if (TIER3.some(p=>p.test(t))) { tier=3; score+=15; }
-  if (AVOID_IND.some(k=>ind.includes(k)||co.includes(k)))       score-=30;
-  else if (TARGET_IND.some(k=>ind.includes(k)||co.includes(k))) score+=20;
-  if (SIEMS.some(s=>t.includes(s)||co.includes(s))) score+=15;
-  if (/enterprise|fortune|global|inc\b|corp\b|ltd\b|llc\b/.test(co)) score+=5;
-  return { score: Math.max(0,Math.min(100,score)), tier };
+// Tier 1: SOC / Detection / Threat leadership — requires seniority + function co-occurrence
+const TIER1_PATTERNS = [
+  /\b(vp|vice president|svp|evp)\b.*\b(soc|detection|threat|secops|security.operat|cyber.defense|infosec|siem)\b/i,
+  /\b(director|head of|lead of)\b.*\b(soc|detection|threat|secops|security.operat|cyber.defense|infosec|siem)\b/i,
+  /\b(manager|senior manager)\b.*\b(soc|detection|threat|secops|security.operat|cyber.defense|siem)\b/i,
+  /\b(soc|detection|threat|secops|cyber.defense)\b.*\b(director|head|vp|manager|lead)\b/i,
+  /detection engineering (manager|director|lead|head)/i,
+  /head of (detection|soc|threat|secops|cyber defense|siem)/i,
+  /\b(director|vp|head|manager).*(detection engineer|threat detection|cyber defense)/i,
+];
+
+// Tier 2: CISO / economic buyer
+const TIER2_PATTERNS = [
+  /\bciso\b/i,
+  /chief information security/i,
+  /\b(vp|svp|evp|head of|director of)\b.*(information security|infosec|cybersecurity)\b/i,
+];
+
+// Tier 3: Practitioners — analysts, engineers, hunters
+const TIER3_PATTERNS = [
+  /\b(soc analyst|security analyst|detection engineer|threat hunter|threat intelligence analyst)\b/i,
+  /\b(senior|lead|principal|staff)\b.*(soc analyst|security analyst|detection engineer|threat hunter)\b/i,
+  /\b(security engineer|network security engineer)\b/i,
+];
+
+// Title keywords that are not disqualifiers but reduce score — heavy penalty
+const TITLE_PENALTY_KEYWORDS = [
+  /\bit\b/i,
+  /\bnetwork\b/i,
+  /\bdevsecops\b/i,
+  /\bdev\b/i,
+  /\bconsulting\b/i,
+  /\bgovernance\b/i,
+  /\brisk\b/i,
+  /\bgrc\b/i,
+  /\binfrastructure\b/i,
+  /\bservice\b/i,
+  /\bassurance\b/i,
+  /\bpolicy\b/i,
+  /\bprogram\b/i,
+];
+
+// Seniority bonus within a tier (+2 to +10)
+function getSeniorityBonus(title) {
+  const t = title.toLowerCase();
+  if (/\b(evp|svp|chief|c-level)\b/.test(t))       return 10;
+  if (/\b(vp|vice president)\b/.test(t))            return 8;
+  if (/\b(director|head of)\b/.test(t))             return 6;
+  if (/\b(senior manager|manager)\b/.test(t))       return 4;
+  if (/\b(senior|lead|principal|staff)\b/.test(t))  return 2;
+  return 0;
 }
 
+// Industry inference from company name — tiered bonus/penalty
+function inferIndustry(companyName) {
+  const c = companyName.toLowerCase();
+  if (/\b(bank|banking|capital|financial|finance|insurance|invest|asset|wealth|credit|fintech|securities|trading|fund|equity|mortgage)\b/.test(c))
+    return 25;
+  if (/\b(energy|electric|power|utility|utilities|oil|gas|petroleum|nuclear|grid|pipeline)\b/.test(c))
+    return 25;
+  if (/\b(manufactur|industrial|aerospace|defense|automotive|chemical|steel|semiconductor)\b/.test(c))
+    return 18;
+  if (/\b(transport|logistics|rail|aviation|airport|port|water|municipal)\b/.test(c))
+    return 18;
+  if (/\b(law firm|legal|attorney|counsel|llp|litigation)\b/.test(c))
+    return 18;
+  if (/\b(health|healthcare|hospital|medical|pharma|biotech|clinical|dental)\b/.test(c))
+    return 12;
+  if (/\b(retail|commerce|ecommerce|consumer|grocery|apparel|fashion)\b/.test(c))
+    return 12;
+  if (/\b(telecom|telecommunications|wireless|mobile|broadband|carrier|cable)\b/.test(c))
+    return 12;
+  if (/\b(tech|technology|software|saas|cloud|platform|digital|data|systems|solutions)\b/.test(c))
+    return 12;
+  if (/\b(university|college|school|academy|institute|education|learning)\b/.test(c))
+    return -5;
+  if (/\b(government|federal|state|county|city of|dept of|department of|agency|municipality)\b/.test(c))
+    return -25;
+  return 5;
+}
+
+// Enterprise size signals from company name
+function inferCompanySize(companyName) {
+  const c = companyName.toLowerCase();
+  if (/\b(global|worldwide|international|group|holdings|enterprises|corporation|systems)\b/.test(c)) return 8;
+  if (/\b(inc|corp|co|ltd|llc|solutions|services|partners)\b/.test(c)) return 4;
+  return 0;
+}
+
+// Geography — checks a location column first, then falls back to company name
+// North America: +10 | Middle East: -15 | APAC: -15 | Unknown: 0
+const NA_PATTERNS = [
+  /\b(united states|usa|u\.s\.a\.|canada|mexico)\b/i,
+  /\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\b/,
+  /\b(alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming)\b/i,
+  /\b(new york|los angeles|chicago|houston|phoenix|philadelphia|san francisco|seattle|denver|boston|atlanta|miami|dallas|austin|nashville|charlotte|minneapolis|portland|las vegas|detroit|raleigh|san diego|san jose|washington dc|toronto|vancouver|montreal|calgary|ottawa)\b/i,
+];
+const ME_PATTERNS = [
+  /\b(saudi arabia|uae|united arab emirates|dubai|abu dhabi|qatar|kuwait|bahrain|oman|jordan|israel|egypt|iran|iraq|turkey|lebanon|riyadh|doha|muscat|amman|tel aviv|cairo|istanbul)\b/i,
+];
+const APAC_PATTERNS = [
+  /\b(china|japan|india|australia|singapore|south korea|hong kong|taiwan|indonesia|malaysia|thailand|vietnam|philippines|new zealand|beijing|shanghai|tokyo|osaka|mumbai|delhi|bangalore|sydney|melbourne|seoul|bangkok|jakarta|kuala lumpur|manila|auckland|pune|hyderabad|chennai)\b/i,
+];
+
+function inferGeography(locationVal, companyName) {
+  for (const src of [locationVal, companyName].filter(Boolean)) {
+    if (ME_PATTERNS.some(p => p.test(src)))   return -15;
+    if (APAC_PATTERNS.some(p => p.test(src)))  return -15;
+    if (NA_PATTERNS.some(p => p.test(src)))    return 10;
+  }
+  return 0;
+}
+
+// Cybersecurity vendor detection — known list + keyword patterns
+const KNOWN_CYBER_VENDORS = [
+  "crowdstrike","palo alto","sentinelone","microsoft","google","amazon","aws","ibm",
+  "splunk","elastic","sumo logic","exabeam","secureworks","rapid7","tenable","qualys",
+  "fortinet","checkpoint","cisco","juniper","symantec","broadcom","mcafee","trellix",
+  "trend micro","sophos","bitdefender","eset","kaspersky","cylance","carbon black",
+  "cybereason","darktrace","vectra","illumio","zscaler","okta","sailpoint","beyondtrust",
+  "cyberark","delinea","varonis","forcepoint","proofpoint","mimecast","cofense",
+  "knowbe4","abnormal","ironscales","recorded future","mandiant","fireeye","tanium",
+  "axonius","lacework","orca","wiz","logrhythm","securonix","devo","hunters",
+  "coralogix","qradar","arcsight","netsurion","trustwave","coalfire","optiv",
+  "guidepoint","herjavec","cdw","ntt","accenture","deloitte","kpmg","pwc",
+  "booz allen","leidos","saic","cardinalops"
+];
+const CYBER_VENDOR_KEYWORDS = /\b(mssp|managed security|managed detection|xdr provider|security operations center|soc as a service|threat intelligence firm|penetration testing firm|red team|security consulting|cyber consulting)\b/i;
+
+function isCyberVendor(companyName) {
+  const c = companyName.toLowerCase().trim();
+  if (KNOWN_CYBER_VENDORS.some(v => c.includes(v))) return true;
+  if (CYBER_VENDOR_KEYWORDS.test(companyName)) return true;
+  return false;
+}
+
+// SIEM signal bonus
+const SIEM_PATTERNS = [/splunk/i,/sentinel/i,/qradar/i,/chronicle/i,/sumo logic/i,/elastic/i,/crowdstrike/i,/xsiam/i,/coralogix/i];
+
+function scoreICP(row, titleCol, emailCol, companyCol, industryCol) {
+  const title   = (row[titleCol]  || "").trim();
+  const company = (row[companyCol]|| "").trim();
+
+  // Auto-detect a location column if present
+  const locationCol = Object.keys(row).find(k =>
+    /\b(location|city|state|country|region|hq|headquarter|geo)\b/i.test(k)
+  ) || null;
+  const locationVal = locationCol ? (row[locationCol] || "") : "";
+
+  let score = 0;
+  let tier  = null;
+
+  // Tier detection
+  if (TIER1_PATTERNS.some(p => p.test(title))) {
+    tier = 1; score += 45;
+  } else if (TIER2_PATTERNS.some(p => p.test(title))) {
+    tier = 2; score += 28;
+  } else if (TIER3_PATTERNS.some(p => p.test(title))) {
+    tier = 3; score += 12;
+  }
+
+  // Only score further if a tier matched
+  if (tier !== null) {
+    // Seniority bonus (+2 to +10)
+    score += getSeniorityBonus(title);
+
+    // Title penalty keywords — -22 each, capped at -30 total
+    let penalty = 0;
+    for (const pattern of TITLE_PENALTY_KEYWORDS) {
+      if (pattern.test(title)) { penalty += 22; if (penalty >= 30) break; }
+    }
+    score -= Math.min(penalty, 30);
+
+    // Industry inference from company name
+    score += inferIndustry(company);
+
+    // Geography (+10 NA / -15 ME / -15 APAC)
+    score += inferGeography(locationVal, company);
+
+    // Company size signals (+4 to +8)
+    score += inferCompanySize(company);
+
+    // Cybersecurity vendor penalty (-18)
+    if (isCyberVendor(company)) score -= 18;
+
+    // SIEM signal in title or company (+12)
+    if (SIEM_PATTERNS.some(p => p.test(title) || p.test(company))) score += 12;
+  }
+
+  return { score: Math.max(0, Math.min(100, score)), tier };
+}
+
+// ── File Parsing ──────────────────────────────────────────────────────────────
 function parseCSVText(text) {
   const lines = text.trim().split(/\r?\n/);
   const headers = lines[0].split(",").map(h=>h.replace(/^"|"$/g,"").trim());
@@ -93,6 +267,7 @@ function detectCol(headers, keywords) {
   return headers.find(h => keywords.some(k => h.toLowerCase().includes(k))) || null;
 }
 
+// ── CSV Download ──────────────────────────────────────────────────────────────
 function downloadCSV(processed, headers, fileName) {
   const tierLabel = t => t===1?"Tier 1":t===2?"Tier 2":t===3?"Tier 3":"";
   const esc = val => {
@@ -119,6 +294,7 @@ function downloadCSV(processed, headers, fileName) {
   URL.revokeObjectURL(url);
 }
 
+// ── Visual Helpers ────────────────────────────────────────────────────────────
 const tierInfo = t => {
   if (t===1) return { label:"Tier 1", color:"#00e5a0" };
   if (t===2) return { label:"Tier 2", color:"#f5c842" };
@@ -194,6 +370,7 @@ function LeadTable({ leads, results, showScore }) {
   );
 }
 
+// ── Main App ──────────────────────────────────────────────────────────────────
 function App() {
   const [stage,      setStage]      = useState("upload");
   const [dragging,   setDragging]   = useState(false);
@@ -333,10 +510,10 @@ function App() {
 
             <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:28}}>
               {[
-                {label:"Total Leads", value:results.total,            color:"#ccc"},
-                {label:"Qualified",   value:results.qualified.length, color:"#00e5a0",glow:true},
+                {label:"Total Leads", value:results.total,             color:"#ccc"},
+                {label:"Qualified",   value:results.qualified.length,  color:"#00e5a0",glow:true},
                 {label:"Unqualified", value:results.unqualified.length,color:"#ff5e5e"},
-                {label:"Qual Rate",   value:qualPct+"%",              color:"#f5c842"},
+                {label:"Qual Rate",   value:qualPct+"%",               color:"#f5c842"},
               ].map(c=>(
                 <div key={c.label} style={{background:"rgba(255,255,255,0.025)",border:"1px solid #141820",borderRadius:14,padding:"22px 24px"}}>
                   <div style={{color:"#3a4050",fontSize:10,letterSpacing:"2px",textTransform:"uppercase",marginBottom:10}}>{c.label}</div>
